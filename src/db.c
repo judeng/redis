@@ -84,9 +84,15 @@ void updateLFU(robj *val) {
  * Even if the key expiry is master-driven, we can correctly report a key is
  * expired on replicas even if the master is lagging expiring our key via DELs
  * in the replication link. */
-robj *lookupKey(redisDb *db, robj *key, int flags) {
-    dictEntry *de = dictFind(db->dict,key->ptr);
+robj *lookupKey(redisDb *db, robj *key, int flags, void **pos) {
     robj *val = NULL;
+    dictEntry *de = NULL;
+    if (pos) {
+        *pos = dictFindPositionForInsert(db->dict, key->ptr, &de);
+    } else {
+        de = dictFind(db->dict, key->ptr);
+    }
+
     if (de) {
         val = dictGetVal(de);
         /* Forcing deletion of expired keys on a replica makes the replica
@@ -149,7 +155,7 @@ robj *lookupKey(redisDb *db, robj *key, int flags) {
  * the key. */
 robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
     serverAssert(!(flags & LOOKUP_WRITE));
-    return lookupKey(db, key, flags);
+    return lookupKey(db, key, flags, NULL);
 }
 
 /* Like lookupKeyReadWithFlags(), but does not use any flag, which is the
@@ -165,11 +171,20 @@ robj *lookupKeyRead(redisDb *db, robj *key) {
  * Returns the linked value object if the key exists or NULL if the key
  * does not exist in the specified DB. */
 robj *lookupKeyWriteWithFlags(redisDb *db, robj *key, int flags) {
-    return lookupKey(db, key, flags | LOOKUP_WRITE);
+    return lookupKey(db, key, flags | LOOKUP_WRITE, NULL);
 }
 
 robj *lookupKeyWrite(redisDb *db, robj *key) {
     return lookupKeyWriteWithFlags(db, key, LOOKUP_NONE);
+}
+
+robj *lookupKeyWriteOrInsert(redisDb *db, robj *key, void **pos) { return lookupKey(db, key, LOOKUP_WRITE, pos); }
+
+void *lookupKeyCreate(client *c, robj *key, int type) {
+    void *newpos = NULL;
+    robj *o = lookupKeyWriteOrInsert(c->db, key, &newpos);
+    if (checkType(c, o, type))
+        return NULL;
 }
 
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply) {
@@ -184,6 +199,16 @@ robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
     return o;
 }
 
+void dbAddDefinitePosition(redisDb *db, robj *key, robj *val, void *pos) {
+    sds copy = sdsdup(key->ptr);
+    dictEntry *de = dictInsertAtPosition(db->dict, copy, pos);
+    // dictSetKey(db->dict, de, copy);
+    dictSetVal(db->dict, de, val);
+    signalKeyAsReady(db, key, val->type);
+    if (server.cluster_enabled)
+        slotToKeyAddEntry(de, db);
+    notifyKeyspaceEvent(NOTIFY_NEW, "new", key, db->id);
+}
 /* Add the key to the DB. It's up to the caller to increment the reference
  * counter of the value if needed.
  *
@@ -278,22 +303,31 @@ void dbReplaceValue(redisDb *db, robj *key, robj *val) {
  * All the new keys in the database should be created via this interface.
  * The client 'c' argument may be set to NULL if the operation is performed
  * in a context where there is no clear client performing the operation. */
-void setKey(client *c, redisDb *db, robj *key, robj *val, int flags) {
+static void setKeyInternal(client *c, redisDb *db, robj *key, robj *val, int flags, void *pos) {
     int keyfound = 0;
 
     if (flags & SETKEY_ALREADY_EXIST)
         keyfound = 1;
     else if (!(flags & SETKEY_DOESNT_EXIST))
-        keyfound = (lookupKeyWrite(db,key) != NULL);
+        keyfound = (lookupKeyWrite(db, key) != NULL);
 
     if (!keyfound) {
-        dbAdd(db,key,val);
+        if (pos)
+            dbAddDefinitePosition(db, key, val, pos);
+        else
+            dbAdd(db, key, val);
     } else {
-        dbSetValue(db,key,val,1);
+        dbSetValue(db, key, val, 1);
     }
     incrRefCount(val);
-    if (!(flags & SETKEY_KEEPTTL)) removeExpire(db,key);
-    if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c,db,key);
+    if (!(flags & SETKEY_KEEPTTL))
+        removeExpire(db, key);
+    if (!(flags & SETKEY_NO_SIGNAL))
+        signalModifiedKey(c, db, key);
+}
+void setKey(client *c, redisDb *db, robj *key, robj *val, int flags) { setKeyInternal(c, db, key, val, flags, NULL); }
+void setKeyAtPosition(client *c, redisDb *db, robj *key, robj *val, int flags, void *pos) {
+    setKeyInternal(c, db, key, val, flags, pos);
 }
 
 /* Return a random key, in form of a Redis object.

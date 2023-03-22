@@ -431,12 +431,13 @@ sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what) {
 }
 
 robj *hashTypeLookupWriteOrCreate(client *c, robj *key) {
-    robj *o = lookupKeyWrite(c->db,key);
+    void *pos = NULL;
+    robj *o = lookupKeyWriteOrInsert(c->db, key, &pos);
     if (checkType(c,o,OBJ_HASH)) return NULL;
 
     if (o == NULL) {
         o = createHashObject();
-        dbAdd(c->db,key,o);
+        dbAddDefinitePosition(c->db, key, o, pos);
     }
     return o;
 }
