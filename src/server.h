@@ -3244,6 +3244,7 @@ int checkAlreadyExpired(long long when);
 robj *lookupKeyRead(redisDb *db, robj *key);
 robj *lookupKeyWrite(redisDb *db, robj *key);
 robj *lookupKeyWriteOrInsert(redisDb *db, robj *key, void **pos);
+dictEntry *lookupKeyWriteRaw(redisDb *db, robj *key, void **pos);
 void dbAddDefinitePosition(redisDb *db, robj *key, robj *val, void *pos);
 void setKeyAtPosition(client *c, redisDb *db, robj *key, robj *val, int flags, void *pos);
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply);
@@ -3271,6 +3272,7 @@ void dbReplaceValue(redisDb *db, robj *key, robj *val);
 #define SETKEY_ALREADY_EXIST 4
 #define SETKEY_DOESNT_EXIST 8
 void setKey(client *c, redisDb *db, robj *key, robj *val, int flags);
+void setKeyAtEntry(client *c, redisDb *db, robj *key, robj *val, int flags, dictEntry *de);
 robj *dbRandomKey(redisDb *db);
 int dbGenericDelete(redisDb *db, robj *key, int async, int flags);
 int dbSyncDelete(redisDb *db, robj *key);

@@ -449,7 +449,8 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing)
 {
     /* Get the position for the new key or NULL if the key already exists. */
     void *position = dictFindPositionForInsert(d, key, existing);
-    if (!position) return NULL;
+    if ((existing && *existing) || (!existing && !position))
+        return NULL;
 
     /* Dup the key if necessary. */
     if (d->type->keyDup) key = d->type->keyDup(d, key);
@@ -1447,8 +1448,12 @@ void *dictFindPositionForInsert(dict *d, const void *key, dictEntry **existing) 
         while(he) {
             void *he_key = dictGetKey(he);
             if (key == he_key || dictCompareKeys(d, key, he_key)) {
-                if (existing) *existing = he;
-                return NULL;
+                if (existing) { // if we care about the existing state, possibly still need its positon;
+                    *existing = he;
+                    break;
+                } else {
+                    return NULL;
+                }
             }
             he = dictGetNext(he);
         }

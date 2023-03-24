@@ -84,14 +84,10 @@ void updateLFU(robj *val) {
  * Even if the key expiry is master-driven, we can correctly report a key is
  * expired on replicas even if the master is lagging expiring our key via DELs
  * in the replication link. */
-robj *lookupKey(redisDb *db, robj *key, int flags, void **pos) {
+dictEntry *lookupKeyRaw(redisDb *db, robj *key, int flags, void **pos) {
     robj *val = NULL;
     dictEntry *de = NULL;
-    if (pos) {
-        *pos = dictFindPositionForInsert(db->dict, key->ptr, &de);
-    } else {
-        de = dictFind(db->dict, key->ptr);
-    }
+    void *postmp = dictFindPositionForInsert(db->dict, key->ptr, &de);
 
     if (de) {
         val = dictGetVal(de);
@@ -141,9 +137,22 @@ robj *lookupKey(redisDb *db, robj *key, int flags, void **pos) {
         /* TODO: Use separate misses stats and notify event for WRITE */
     }
 
-    return val;
+    if (val) {
+        if (pos)
+            *pos = NULL;
+        return de;
+    } else {
+        if (pos)
+            *pos = postmp;
+        return NULL;
+    }
 }
-
+robj *lookupKey(redisDb *db, robj *key, int flags, void **pos) {
+    dictEntry *de = lookupKeyRaw(db, key, flags, pos);
+    if (!de)
+        return NULL;
+    return dictGetVal(de);
+}
 /* Lookup a key for read operations, or return NULL if the key is not found
  * in the specified DB.
  *
@@ -179,6 +188,7 @@ robj *lookupKeyWrite(redisDb *db, robj *key) {
 }
 
 robj *lookupKeyWriteOrInsert(redisDb *db, robj *key, void **pos) { return lookupKey(db, key, LOOKUP_WRITE, pos); }
+dictEntry *lookupKeyWriteRaw(redisDb *db, robj *key, void **pos) { return lookupKeyRaw(db, key, LOOKUP_WRITE, pos); }
 
 void *lookupKeyCreate(client *c, robj *key, int type) {
     void *newpos = NULL;
@@ -252,8 +262,10 @@ int dbAddRDBLoad(redisDb *db, sds key, robj *val) {
  * update of a value of an existing key (when false).
  *
  * The program is aborted if the key was not already present. */
-static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite) {
-    dictEntry *de = dictFind(db->dict,key->ptr);
+static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite, dictEntry *de) {
+    if (!de) {
+        de = dictFind(db->dict, key->ptr);
+    }
 
     serverAssertWithInfo(NULL,key,de != NULL);
     robj *old = dictGetVal(de);
@@ -286,9 +298,7 @@ static void dbSetValue(redisDb *db, robj *key, robj *val, int overwrite) {
 
 /* Replace an existing key with a new value, we just replace value and don't
  * emit any events */
-void dbReplaceValue(redisDb *db, robj *key, robj *val) {
-    dbSetValue(db, key, val, 0);
-}
+void dbReplaceValue(redisDb *db, robj *key, robj *val) { dbSetValue(db, key, val, 0, NULL); }
 
 /* High level Set operation. This function can be used in order to set
  * a key, whatever it was existing or not, to a new object.
@@ -303,7 +313,7 @@ void dbReplaceValue(redisDb *db, robj *key, robj *val) {
  * All the new keys in the database should be created via this interface.
  * The client 'c' argument may be set to NULL if the operation is performed
  * in a context where there is no clear client performing the operation. */
-static void setKeyInternal(client *c, redisDb *db, robj *key, robj *val, int flags, void *pos) {
+static void setKeyInternal(client *c, redisDb *db, robj *key, robj *val, int flags, void *pos, dictEntry *de) {
     int keyfound = 0;
 
     if (flags & SETKEY_ALREADY_EXIST)
@@ -317,7 +327,11 @@ static void setKeyInternal(client *c, redisDb *db, robj *key, robj *val, int fla
         else
             dbAdd(db, key, val);
     } else {
-        dbSetValue(db, key, val, 1);
+        if (de) {
+            dbSetValue(db, key, val, 1, de);
+        } else {
+            dbSetValue(db, key, val, 1, NULL);
+        }
     }
     incrRefCount(val);
     if (!(flags & SETKEY_KEEPTTL))
@@ -325,9 +339,14 @@ static void setKeyInternal(client *c, redisDb *db, robj *key, robj *val, int fla
     if (!(flags & SETKEY_NO_SIGNAL))
         signalModifiedKey(c, db, key);
 }
-void setKey(client *c, redisDb *db, robj *key, robj *val, int flags) { setKeyInternal(c, db, key, val, flags, NULL); }
+void setKey(client *c, redisDb *db, robj *key, robj *val, int flags) {
+    setKeyInternal(c, db, key, val, flags, NULL, NULL);
+}
 void setKeyAtPosition(client *c, redisDb *db, robj *key, robj *val, int flags, void *pos) {
-    setKeyInternal(c, db, key, val, flags, pos);
+    setKeyInternal(c, db, key, val, flags, pos, NULL);
+}
+void setKeyAtEntry(client *c, redisDb *db, robj *key, robj *val, int flags, dictEntry *de) {
+    setKeyInternal(c, db, key, val, flags, NULL, de);
 }
 
 /* Return a random key, in form of a Redis object.

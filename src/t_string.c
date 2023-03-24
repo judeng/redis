@@ -94,8 +94,8 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
         if (getGenericCommand(c) == C_ERR) return;
     }
     void *pos = NULL;
-    found = (lookupKeyWriteOrInsert(c->db, key, &pos) != NULL);
-
+    dictEntry *de = lookupKeyWriteRaw(c->db, key, &pos);
+    found = (de != NULL);
     if ((flags & OBJ_SET_NX && found) ||
         (flags & OBJ_SET_XX && !found))
     {
@@ -108,8 +108,12 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
     /* When expire is not NULL, we avoid deleting the TTL so it can be updated later instead of being deleted and then created again. */
     setkey_flags |= ((flags & OBJ_KEEPTTL) || expire) ? SETKEY_KEEPTTL : 0;
     setkey_flags |= found ? SETKEY_ALREADY_EXIST : SETKEY_DOESNT_EXIST;
+    if (pos) {
+        setKeyAtPosition(c, c->db, key, val, setkey_flags, pos);
+    } else {
+        setKeyAtEntry(c, c->db, key, val, setkey_flags, de);
+    }
 
-    setKeyAtPosition(c, c->db, key, val, setkey_flags, pos);
     server.dirty++;
     notifyKeyspaceEvent(NOTIFY_STRING,"set",key,c->db->id);
 
