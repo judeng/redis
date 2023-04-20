@@ -58,6 +58,7 @@
 #include "monotonic.h"
 #include "script.h"
 #include "call_reply.h"
+#include "hdr_histogram.h"
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -516,13 +517,20 @@ void moduleCreateContext(RedisModuleCtx *out_ctx, RedisModule *module, int ctx_f
  * You should avoid using malloc().
  * This function panics if unable to allocate enough memory. */
 void *RM_Alloc(size_t bytes) {
-    return zmalloc(bytes);
+    /* Use 'zmalloc_usable()' instead of 'zmalloc()' to allow the compiler
+     * to recognize the additional memory size, which means that modules can
+     * use the memory reported by 'RM_MallocUsableSize()' safely. In theory this
+     * isn't really needed since this API can't be inlined (not even for embedded
+     * modules like TLS (we use function pointers for module APIs), and the API doesn't
+     * have the malloc_size attribute, but it's hard to predict how smart future compilers
+     * will be, so better safe than sorry. */
+    return zmalloc_usable(bytes,NULL);
 }
 
 /* Similar to RM_Alloc, but returns NULL in case of allocation failure, instead
  * of panicking. */
 void *RM_TryAlloc(size_t bytes) {
-    return ztrymalloc(bytes);
+    return ztrymalloc_usable(bytes,NULL);
 }
 
 /* Use like calloc(). Memory allocated with this function is reported in
@@ -530,12 +538,12 @@ void *RM_TryAlloc(size_t bytes) {
  * and in general is taken into account as memory allocated by Redis.
  * You should avoid using calloc() directly. */
 void *RM_Calloc(size_t nmemb, size_t size) {
-    return zcalloc(nmemb*size);
+    return zcalloc_usable(nmemb*size,NULL);
 }
 
 /* Use like realloc() for memory obtained with RedisModule_Alloc(). */
 void* RM_Realloc(void *ptr, size_t bytes) {
-    return zrealloc(ptr,bytes);
+    return zrealloc_usable(ptr,bytes,NULL);
 }
 
 /* Use like free() for memory obtained by RedisModule_Alloc() and
@@ -2986,6 +2994,32 @@ int RM_ReplyWithError(RedisModuleCtx *ctx, const char *err) {
     client *c = moduleGetReplyClient(ctx);
     if (c == NULL) return REDISMODULE_OK;
     addReplyErrorFormat(c,"-%s",err);
+    return REDISMODULE_OK;
+}
+
+/* Reply with the error create from a printf format and arguments.
+ *
+ * If the error code is already passed in the string 'fmt', the error
+ * code provided is used, otherwise the string "-ERR " for the generic
+ * error code is automatically added.
+ *
+ * The usage is, for example:
+ *
+ *     RedisModule_ReplyWithErrorFormat(ctx, "An error: %s", "foo");
+ *
+ *     RedisModule_ReplyWithErrorFormat(ctx, "-WRONGTYPE Wrong Type: %s", "foo");
+ *
+ * The function always returns REDISMODULE_OK.
+ */
+int RM_ReplyWithErrorFormat(RedisModuleCtx *ctx, const char *fmt, ...) {
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return REDISMODULE_OK;
+
+    va_list ap;
+    va_start(ap, fmt);
+    addReplyErrorFormatInternal(c, 0, fmt, ap);
+    va_end(ap);
+
     return REDISMODULE_OK;
 }
 
@@ -10704,6 +10738,9 @@ size_t RM_MallocSize(void* ptr) {
 /* Similar to RM_MallocSize, the difference is that RM_MallocUsableSize
  * returns the usable size of memory by the module. */
 size_t RM_MallocUsableSize(void *ptr) {
+    /* It is safe to use 'zmalloc_usable_size()' to manipulate additional
+     * memory space, as we guarantee that the compiler can recognize this
+     * after 'RM_Alloc', 'RM_TryAlloc', 'RM_Realloc', or 'RM_Calloc'. */
     return zmalloc_usable_size(ptr);
 }
 
@@ -12751,6 +12788,137 @@ int RM_LoadConfigs(RedisModuleCtx *ctx) {
     return REDISMODULE_OK;
 }
 
+/* --------------------------------------------------------------------------
+ * ## RDB load/save API
+ * -------------------------------------------------------------------------- */
+
+#define REDISMODULE_RDB_STREAM_FILE 1
+
+typedef struct RedisModuleRdbStream {
+    int type;
+
+    union {
+        char *filename;
+    } data;
+} RedisModuleRdbStream;
+
+/* Create a stream object to save/load RDB to/from a file.
+ *
+ * This function returns a pointer to RedisModuleRdbStream which is owned
+ * by the caller. It requires a call to RM_RdbStreamFree() to free
+ * the object. */
+RedisModuleRdbStream *RM_RdbStreamCreateFromFile(const char *filename) {
+    RedisModuleRdbStream *stream = zmalloc(sizeof(*stream));
+    stream->type = REDISMODULE_RDB_STREAM_FILE;
+    stream->data.filename = zstrdup(filename);
+    return stream;
+}
+
+/* Release an RDB stream object. */
+void RM_RdbStreamFree(RedisModuleRdbStream *stream) {
+    switch (stream->type) {
+    case REDISMODULE_RDB_STREAM_FILE:
+        zfree(stream->data.filename);
+        break;
+    default:
+        serverAssert(0);
+        break;
+    }
+    zfree(stream);
+}
+
+/* Load RDB file from the `stream`. Dataset will be cleared first and then RDB
+ * file will be loaded.
+ *
+ * `flags` must be zero. This parameter is for future use.
+ *
+ * On success REDISMODULE_OK is returned, otherwise REDISMODULE_ERR is returned
+ * and errno is set accordingly.
+ *
+ * Example:
+ *
+ *     RedisModuleRdbStream *s = RedisModule_RdbStreamCreateFromFile("exp.rdb");
+ *     RedisModule_RdbLoad(ctx, s, 0);
+ *     RedisModule_RdbStreamFree(s);
+ */
+int RM_RdbLoad(RedisModuleCtx *ctx, RedisModuleRdbStream *stream, int flags) {
+    UNUSED(ctx);
+
+    if (!stream || flags != 0) {
+        errno = EINVAL;
+        return REDISMODULE_ERR;
+    }
+
+    /* Not allowed on replicas. */
+    if (server.masterhost != NULL) {
+        errno = ENOTSUP;
+        return REDISMODULE_ERR;
+    }
+
+    /* Drop replicas if exist. */
+    disconnectSlaves();
+    freeReplicationBacklog();
+
+    if (server.aof_state != AOF_OFF) stopAppendOnly();
+
+    /* Kill existing RDB fork as it is saving outdated data. Also killing it
+     * will prevent COW memory issue. */
+    if (server.child_type == CHILD_TYPE_RDB) killRDBChild();
+
+    emptyData(-1,EMPTYDB_NO_FLAGS,NULL);
+
+    /* rdbLoad() can go back to the networking and process network events. If
+     * RM_RdbLoad() is called inside a command callback, we don't want to
+     * process the current client. Otherwise, we may free the client or try to
+     * process next message while we are already in the command callback. */
+    if (server.current_client) protectClient(server.current_client);
+
+    serverAssert(stream->type == REDISMODULE_RDB_STREAM_FILE);
+    int ret = rdbLoad(stream->data.filename,NULL,RDBFLAGS_NONE);
+
+    if (server.current_client) unprotectClient(server.current_client);
+    if (server.aof_state != AOF_OFF) startAppendOnly();
+
+    if (ret != RDB_OK) {
+        errno = (ret == RDB_NOT_EXIST) ? ENOENT : EIO;
+        return REDISMODULE_ERR;
+    }
+
+    errno = 0;
+    return REDISMODULE_OK;
+}
+
+/* Save dataset to the RDB stream.
+ *
+ * `flags` must be zero. This parameter is for future use.
+ *
+ * On success REDISMODULE_OK is returned, otherwise REDISMODULE_ERR is returned
+ * and errno is set accordingly.
+ *
+ * Example:
+ *
+ *     RedisModuleRdbStream *s = RedisModule_RdbStreamCreateFromFile("exp.rdb");
+ *     RedisModule_RdbSave(ctx, s, 0);
+ *     RedisModule_RdbStreamFree(s);
+ */
+int RM_RdbSave(RedisModuleCtx *ctx, RedisModuleRdbStream *stream, int flags) {
+    UNUSED(ctx);
+
+    if (!stream || flags != 0) {
+        errno = EINVAL;
+        return REDISMODULE_ERR;
+    }
+
+    serverAssert(stream->type == REDISMODULE_RDB_STREAM_FILE);
+
+    if (rdbSaveToFile(stream->data.filename) != C_OK) {
+        return REDISMODULE_ERR;
+    }
+
+    errno = 0;
+    return REDISMODULE_OK;
+}
+
 /* Redis MODULE command.
  *
  * MODULE LIST
@@ -13297,6 +13465,7 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(WrongArity);
     REGISTER_API(ReplyWithLongLong);
     REGISTER_API(ReplyWithError);
+    REGISTER_API(ReplyWithErrorFormat);
     REGISTER_API(ReplyWithSimpleString);
     REGISTER_API(ReplyWithArray);
     REGISTER_API(ReplyWithMap);
@@ -13627,4 +13796,8 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(RegisterEnumConfig);
     REGISTER_API(LoadConfigs);
     REGISTER_API(RegisterAuthCallback);
+    REGISTER_API(RdbStreamCreateFromFile);
+    REGISTER_API(RdbStreamFree);
+    REGISTER_API(RdbLoad);
+    REGISTER_API(RdbSave);
 }

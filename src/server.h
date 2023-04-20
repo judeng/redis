@@ -53,7 +53,6 @@
 #include <sys/socket.h>
 #include <lua.h>
 #include <signal.h>
-#include "hdr_histogram.h"
 
 #ifdef HAVE_LIBSYSTEMD
 #include <systemd/sd-daemon.h>
@@ -91,6 +90,8 @@ typedef struct redisObject robj;
 #include "sha1.h"
 #include "endianconv.h"
 #include "crc64.h"
+
+struct hdr_histogram;
 
 /* helpers */
 #define numElements(x) (sizeof(x)/sizeof((x)[0]))
@@ -2553,6 +2554,7 @@ void setDeferredReplyBulkSds(client *c, void *node, sds s);
 void addReplyErrorObject(client *c, robj *err);
 void addReplyOrErrorObject(client *c, robj *reply);
 void afterErrorReply(client *c, const char *s, size_t len, int flags);
+void addReplyErrorFormatInternal(client *c, int flags, const char *fmt, va_list ap);
 void addReplyErrorSdsEx(client *c, sds err, int flags);
 void addReplyErrorSds(client *c, sds err);
 void addReplyErrorSdsSafe(client *c, sds err);
@@ -3171,7 +3173,7 @@ void loadServerConfig(char *filename, char config_from_stdin, char *options);
 void appendServerSaveParams(time_t seconds, int changes);
 void resetServerSaveParams(void);
 struct rewriteConfigState; /* Forward declaration to export API. */
-void rewriteConfigRewriteLine(struct rewriteConfigState *state, const char *option, sds line, int force);
+int rewriteConfigRewriteLine(struct rewriteConfigState *state, const char *option, sds line, int force);
 void rewriteConfigMarkAsProcessed(struct rewriteConfigState *state, const char *option);
 int rewriteConfig(char *path, int force_write);
 void initConfigValues();
