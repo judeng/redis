@@ -3483,7 +3483,13 @@ void call(client *c, int flags) {
     monotime monotonic_start = 0;
     if (monotonicGetType() == MONOTONIC_CLOCK_HW)
         monotonic_start = getMonotonicUs();
-
+    struct rusage usage;
+    long long cpu_start = 0;
+    if (server.slowlog_log_slower_than > 0) {
+        getrusage(RUSAGE_THREAD, &usage);
+        cpu_start = usage.ru_stime.tv_sec * 1000000LL + usage.ru_stime.tv_usec + usage.ru_utime.tv_sec * 1000000LL +
+                    usage.ru_utime.tv_usec;
+    }
     c->cmd->proc(c);
 
     exitExecutionUnit();
@@ -3536,8 +3542,15 @@ void call(client *c, int flags) {
 
     /* Log the command into the Slow log if needed.
      * If the client is blocked we will handle slowlog when it is unblocked. */
-    if (update_command_stats && !(c->flags & CLIENT_BLOCKED))
-        slowlogPushCurrentCommand(c, real_cmd, c->duration);
+    if (update_command_stats && !(c->flags & CLIENT_BLOCKED)) {
+        if (c->duration > server.slowlog_log_slower_than && !(c->cmd->flags & CMD_SKIP_SLOWLOG)) {
+            getrusage(RUSAGE_THREAD, &usage);
+            long long cpu_duration = usage.ru_stime.tv_sec * 1000000LL + usage.ru_stime.tv_usec + usage.ru_utime.tv_usec +
+                                 usage.ru_utime.tv_sec * 1000000LL - cpu_start;
+            cpu_duration=0;
+            slowlogPushCurrentCommand(c, real_cmd, c->duration);
+        }
+    }
 
     /* Send the command to clients in MONITOR mode if applicable,
      * since some administrative commands are considered too dangerous to be shown.
