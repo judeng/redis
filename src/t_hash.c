@@ -34,6 +34,18 @@
  * Hash type API
  *----------------------------------------------------------------------------*/
 
+size_t hashTypeSize(robj *o) {
+    if (o->encoding == OBJ_ENCODING_LISTPACK) {
+        return zmalloc_size(o->ptr) + sizeof(robj);
+    } else if (o->encoding == OBJ_ENCODING_HT) {
+        dict *d = o->ptr;
+        return d->size + sizeof(dictEntry) * dictSize(d) + sizeof(dictEntry *) * dictSlots(d) + sizeof(robj);
+    } else {
+        serverAssert(0);
+    }
+    return 0;
+}
+
 /* Check the length of a number of objects to see if we need to convert a
  * listpack to a real hash. Note that we only check string encoded objects
  * as their string length can be queried in constant time. */

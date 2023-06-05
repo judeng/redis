@@ -118,6 +118,7 @@ int _dictInit(dict *d, dictType *type)
     d->type = type;
     d->rehashidx = -1;
     d->pauserehash = 0;
+    d->size = sizeof(*d);
     return DICT_OK;
 }
 

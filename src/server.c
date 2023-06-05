@@ -377,6 +377,14 @@ size_t dictEntryMetadataSize(dict *d) {
      * If we ever add non-cluster related data here, that code must be modified too. */
     return server.cluster_enabled ? sizeof(clusterDictEntryMetadata) : 0;
 }
+size_t dictEntryKeyMallocSize(dict *d, void *key) {
+    UNUSED(d);
+    return sdsZmallocSize((sds)key);
+}
+size_t dictEntryValMallocSize(dict *d, void *val) {
+    UNUSED(d);
+    return sdsZmallocSize((sds)val);
+}
 
 /* Generic hash table type where keys are Redis Objects, Values
  * dummy pointers. */
@@ -459,13 +467,16 @@ dictType commandTableDictType = {
 
 /* Hash type hash table (note that small hashes are represented with listpacks) */
 dictType hashDictType = {
-    dictSdsHash,                /* hash function */
-    NULL,                       /* key dup */
-    NULL,                       /* val dup */
-    dictSdsKeyCompare,          /* key compare */
-    dictSdsDestructor,          /* key destructor */
-    dictSdsDestructor,          /* val destructor */
-    NULL                        /* allow to expand */
+    dictSdsHash,            /* hash function */
+    NULL,                   /* key dup */
+    NULL,                   /* val dup */
+    dictSdsKeyCompare,      /* key compare */
+    dictSdsDestructor,      /* key destructor */
+    dictSdsDestructor,      /* val destructor */
+    NULL,                   /* allow to expand */
+    NULL,                   /* meta entry */
+    dictEntryKeyMallocSize, /* size key */
+    dictEntryValMallocSize, /* size value */
 };
 
 /* Dict type without destructor */

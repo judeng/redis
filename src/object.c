@@ -1038,24 +1038,7 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
             serverPanic("Unknown sorted set encoding");
         }
     } else if (o->type == OBJ_HASH) {
-        if (o->encoding == OBJ_ENCODING_LISTPACK) {
-            asize = sizeof(*o)+zmalloc_size(o->ptr);
-        } else if (o->encoding == OBJ_ENCODING_HT) {
-            d = o->ptr;
-            di = dictGetIterator(d);
-            asize = sizeof(*o)+sizeof(dict)+(sizeof(struct dictEntry*)*dictSlots(d));
-            while((de = dictNext(di)) != NULL && samples < sample_size) {
-                ele = dictGetKey(de);
-                ele2 = dictGetVal(de);
-                elesize += sdsZmallocSize(ele) + sdsZmallocSize(ele2);
-                elesize += sizeof(struct dictEntry);
-                samples++;
-            }
-            dictReleaseIterator(di);
-            if (samples) asize += (double)elesize/samples*dictSize(d);
-        } else {
-            serverPanic("Unknown hash encoding");
-        }
+        asize = hashTypeSize(o);
     } else if (o->type == OBJ_STREAM) {
         stream *s = o->ptr;
         asize = sizeof(*o)+sizeof(*s);

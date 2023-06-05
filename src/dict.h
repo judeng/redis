@@ -71,6 +71,8 @@ typedef struct dictType {
     /* Allow a dictEntry to carry extra caller-defined metadata.  The
      * extra memory is initialized to 0 when a dictEntry is allocated. */
     size_t (*dictEntryMetadataBytes)(dict *d);
+    size_t (*keyMallocSize)(dict *d, void *key);
+    size_t (*valMallocSize)(dict *d, void *val);
 } dictType;
 
 #define DICTHT_SIZE(exp) ((exp) == -1 ? 0 : (unsigned long)1<<(exp))
@@ -87,6 +89,10 @@ struct dict {
     /* Keep small vars at end for optimal (minimal) struct padding */
     int16_t pauserehash; /* If >0 rehashing is paused (<0 indicates coding error) */
     signed char ht_size_exp[2]; /* exponent of size. (size = 1<<exp) */
+    
+    int32_t noused; /* 32bit hole */
+    
+    size_t size;    /* 64bit */
 };
 
 /* If safe is set to 1 this is a safe iterator, that means, you can call
@@ -110,15 +116,20 @@ typedef void (dictScanBucketFunction)(dict *d, dictEntry **bucketref);
 #define DICT_HT_INITIAL_SIZE     (1<<(DICT_HT_INITIAL_EXP))
 
 /* ------------------------------- Macros ------------------------------------*/
-#define dictFreeVal(d, entry) \
+#define dictFreeVal(d, entry) do { \
+    if ((d)->type->valMallocSize) \
+        (d)->size -= (d)->type->valMallocSize((d), (entry)->v.val); \
     if ((d)->type->valDestructor) \
-        (d)->type->valDestructor((d), (entry)->v.val)
+        (d)->type->valDestructor((d), (entry)->v.val); \
+    } while(0)
 
 #define dictSetVal(d, entry, _val_) do { \
     if ((d)->type->valDup) \
         (entry)->v.val = (d)->type->valDup((d), _val_); \
     else \
         (entry)->v.val = (_val_); \
+    if ((d)->type->valMallocSize) \
+        (d)->size += (d)->type->valMallocSize((d),(entry)->v.val);\
 } while(0)
 
 #define dictSetSignedIntegerVal(entry, _val_) \
@@ -130,15 +141,22 @@ typedef void (dictScanBucketFunction)(dict *d, dictEntry **bucketref);
 #define dictSetDoubleVal(entry, _val_) \
     do { (entry)->v.d = _val_; } while(0)
 
-#define dictFreeKey(d, entry) \
+#define dictFreeKey(d, entry) do { \
+    if((d)->type->keyMallocSize) { \
+        d->size -= (d)->type->keyMallocSize((d), (entry)->key); \
+    } \
     if ((d)->type->keyDestructor) \
-        (d)->type->keyDestructor((d), (entry)->key)
+        (d)->type->keyDestructor((d), (entry)->key); \
+    } while(0)
 
 #define dictSetKey(d, entry, _key_) do { \
     if ((d)->type->keyDup) \
         (entry)->key = (d)->type->keyDup((d), _key_); \
     else \
         (entry)->key = (_key_); \
+    if((d)->type->keyMallocSize) { \
+        d->size += (d)->type->keyMallocSize((d), (entry)->key); \
+    } \
 } while(0)
 
 #define dictCompareKeys(d, key1, key2) \
