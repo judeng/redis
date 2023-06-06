@@ -117,7 +117,7 @@ typedef void (dictScanBucketFunction)(dict *d, dictEntry **bucketref);
 
 /* ------------------------------- Macros ------------------------------------*/
 #define dictFreeVal(d, entry) do { \
-    if ((d)->type->valMallocSize) \
+    if ((d)->type->valMallocSize && (entry)->v.val) \
         (d)->size -= (d)->type->valMallocSize((d), (entry)->v.val); \
     if ((d)->type->valDestructor) \
         (d)->type->valDestructor((d), (entry)->v.val); \
@@ -128,7 +128,7 @@ typedef void (dictScanBucketFunction)(dict *d, dictEntry **bucketref);
         (entry)->v.val = (d)->type->valDup((d), _val_); \
     else \
         (entry)->v.val = (_val_); \
-    if ((d)->type->valMallocSize) \
+    if ((d)->type->valMallocSize && (entry)->v.val) \
         (d)->size += (d)->type->valMallocSize((d),(entry)->v.val);\
 } while(0)
 
