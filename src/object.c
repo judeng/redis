@@ -971,7 +971,7 @@ size_t streamRadixTreeMemoryUsage(rax *rax) {
  * are checked and averaged to estimate the total size. */
 #define OBJ_COMPUTE_SIZE_DEF_SAMPLES 5 /* Default sample size. */
 size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
-    sds ele, ele2;
+    sds ele;
     dict *d;
     dictIterator *di;
     struct dictEntry *de;
