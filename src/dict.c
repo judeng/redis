@@ -70,6 +70,15 @@ struct dictEntry {
     } v;
     struct dictEntry *next;     /* Next entry in the same hash bucket. */
 };
+typedef struct {
+    void *key;
+    union {
+        void *val;
+        uint64_t u64;
+        int64_t s64;
+        double d;
+    } v;
+} dictEntrySingle;
 
 typedef struct {
     void *key;
@@ -117,9 +126,11 @@ uint64_t dictGenCaseHashFunction(const unsigned char *buf, size_t len) {
  * pointer actually points to. If the least bit is set, it's a key. Otherwise,
  * the bit pattern of the least 3 significant bits mark the kind of entry. */
 
-#define ENTRY_PTR_MASK     7 /* 111 */
-#define ENTRY_PTR_NORMAL   0 /* 000 */
+#define ENTRY_PTR_MASK 7     /* 111 */
+#define ENTRY_PTR_SINGLE 0   /* 000 */
+#define ENTRY_PTR_KEY 1      /* xx1 */
 #define ENTRY_PTR_NO_VALUE 2 /* 010 */
+#define ENTRY_PTR_NORMAL 4   /* 100 */
 
 /* Returns 1 if the entry pointer is a pointer to a key, rather than to an
  * allocated entry. Returns 0 otherwise. */
@@ -138,13 +149,34 @@ static inline int entryIsNormal(const dictEntry *de) {
 static inline int entryIsNoValue(const dictEntry *de) {
     return ((uintptr_t)(void *)de & ENTRY_PTR_MASK) == ENTRY_PTR_NO_VALUE;
 }
-
+/* Return 1 if the entry don't have the next ptr */
+static inline int entryIsSingle(const dictEntry *de) {
+    return ((uintptr_t)(void *)de & ENTRY_PTR_MASK) == ENTRY_PTR_SINGLE;
+}
 /* Creates an entry without a value field. */
 static inline dictEntry *createEntryNoValue(void *key, dictEntry *next) {
     dictEntryNoValue *entry = zmalloc(sizeof(*entry));
     entry->key = key;
     entry->next = next;
     return (dictEntry *)(void *)((uintptr_t)(void *)entry | ENTRY_PTR_NO_VALUE);
+}
+/* Creates an entry without next ptr. */
+static inline dictEntry *createEntrySingle(void *key) {
+    dictEntrySingle *entry = zmalloc(sizeof(*entry));
+    entry->key = key;
+    return (dictEntry *)(entry);
+}
+
+/* Creates an entry without next ptr. */
+static inline dictEntry *createEntryNormal(void *key, dictEntry *next) {
+    dictEntry *entry = zmalloc(sizeof(*entry));
+    entry->key = key;
+    /* Allocate the memory and store the new entry.
+     * Insert the element in top, with the assumption that in a database
+     * system it is more likely that recently added entries are accessed
+     * more frequently. */
+    entry->next = next;
+    return (dictEntry *)(void *)((uintptr_t)(void *)entry | ENTRY_PTR_NORMAL);
 }
 
 static inline dictEntry *encodeMaskedPtr(const void *ptr, unsigned int bits) {
@@ -500,14 +532,12 @@ dictEntry *dictInsertAtPosition(dict *d, void *key, void *position) {
             entry = createEntryNoValue(key, *bucket);
         }
     } else {
-        /* Allocate the memory and store the new entry.
-         * Insert the element in top, with the assumption that in a database
-         * system it is more likely that recently added entries are accessed
-         * more frequently. */
-        entry = zmalloc(sizeof(*entry));
-        assert(entryIsNormal(entry)); /* Check alignment of allocation */
-        entry->key = key;
-        entry->next = *bucket;
+        if (!*bucket) {
+            /* the entry no need next ptr */
+            entry = createEntrySingle(key);
+        } else {
+            entry = createEntryNormal(key, *bucket);
+        }
     }
     *bucket = entry;
     d->ht_used[htidx]++;
@@ -758,82 +788,82 @@ void dictTwoPhaseUnlinkFree(dict *d, dictEntry *he, dictEntry **plink, int table
 void dictSetKey(dict *d, dictEntry* de, void *key) {
     assert(!d->type->no_value);
     if (d->type->keyDup)
-        de->key = d->type->keyDup(d, key);
+        ((dictEntry *)decodeMaskedPtr(de))->key = d->type->keyDup(d, key);
     else
-        de->key = key;
+        ((dictEntry *)decodeMaskedPtr(de))->key = key;
 }
 
 void dictSetVal(dict *d, dictEntry *de, void *val) {
     assert(entryHasValue(de));
-    de->v.val = d->type->valDup ? d->type->valDup(d, val) : val;
+    ((dictEntry *)decodeMaskedPtr(de))->v.val = d->type->valDup ? d->type->valDup(d, val) : val;
 }
 
 void dictSetSignedIntegerVal(dictEntry *de, int64_t val) {
     assert(entryHasValue(de));
-    de->v.s64 = val;
+    ((dictEntry *)decodeMaskedPtr(de))->v.s64 = val;
 }
 
 void dictSetUnsignedIntegerVal(dictEntry *de, uint64_t val) {
     assert(entryHasValue(de));
-    de->v.u64 = val;
+    ((dictEntry *)decodeMaskedPtr(de))->v.u64 = val;
 }
 
 void dictSetDoubleVal(dictEntry *de, double val) {
     assert(entryHasValue(de));
-    de->v.d = val;
+    ((dictEntry *)decodeMaskedPtr(de))->v.d = val;
 }
 
 int64_t dictIncrSignedIntegerVal(dictEntry *de, int64_t val) {
     assert(entryHasValue(de));
-    return de->v.s64 += val;
+    return ((dictEntry *)decodeMaskedPtr(de))->v.s64 += val;
 }
 
 uint64_t dictIncrUnsignedIntegerVal(dictEntry *de, uint64_t val) {
     assert(entryHasValue(de));
-    return de->v.u64 += val;
+    return ((dictEntry *)decodeMaskedPtr(de))->v.u64 += val;
 }
 
 double dictIncrDoubleVal(dictEntry *de, double val) {
     assert(entryHasValue(de));
-    return de->v.d += val;
+    return ((dictEntry *)decodeMaskedPtr(de))->v.d += val;
 }
 
 void *dictGetKey(const dictEntry *de) {
     if (entryIsKey(de)) return (void*)de;
-    if (entryIsNoValue(de)) return decodeEntryNoValue(de)->key;
-    return de->key;
+    return ((dictEntry *)decodeMaskedPtr(de))->key;
 }
 
 void *dictGetVal(const dictEntry *de) {
     assert(entryHasValue(de));
-    return de->v.val;
+    return ((dictEntry *)decodeMaskedPtr(de))->v.val;
 }
 
 int64_t dictGetSignedIntegerVal(const dictEntry *de) {
     assert(entryHasValue(de));
-    return de->v.s64;
+    return ((dictEntry *)decodeMaskedPtr(de))->v.s64;
 }
 
 uint64_t dictGetUnsignedIntegerVal(const dictEntry *de) {
     assert(entryHasValue(de));
-    return de->v.u64;
+    return ((dictEntry *)decodeMaskedPtr(de))->v.u64;
 }
 
 double dictGetDoubleVal(const dictEntry *de) {
     assert(entryHasValue(de));
-    return de->v.d;
+    return ((dictEntry *)decodeMaskedPtr(de))->v.d;
 }
 
 /* Returns a mutable reference to the value as a double within the entry. */
 double *dictGetDoubleValPtr(dictEntry *de) {
     assert(entryHasValue(de));
-    return &de->v.d;
+    return &((dictEntry *)decodeMaskedPtr(de))->v.d;
 }
 
 /* Returns the 'next' field of the entry or NULL if the entry doesn't have a
  * 'next' field. */
 static dictEntry *dictGetNext(const dictEntry *de) {
-    if (entryIsKey(de)) return NULL; /* there's no next */
+    if (entryIsKey(de) || (entryIsSingle(de)))
+        return NULL; /* there's no next */
     if (entryIsNoValue(de)) return decodeEntryNoValue(de)->next;
     return de->next;
 }
@@ -1639,7 +1669,6 @@ void dictGetStats(char *buf, size_t bufsize, dict *d, int full) {
 
 #ifdef REDIS_TEST
 #include "testhelp.h"
-
 #define UNUSED(V) ((void) V)
 
 uint64_t hashCallback(const void *key) {
@@ -1775,6 +1804,13 @@ int dictTest(int argc, char **argv, int flags) {
         assert(retval == DICT_OK);
     }
     end_benchmark("Removing and adding");
+
+    dictEmpty(dict, NULL);
+    dictExpand(dict, count);
+#define HASHTABLE_MAX_LOAD_FACTOR 1.618
+    long long populate = dictBuckets(dict) * HASHTABLE_MAX_LOAD_FACTOR;
+
+    for (j = 0; j < populate; j++) {}
     dictRelease(dict);
     return 0;
 }
