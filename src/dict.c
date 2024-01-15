@@ -197,7 +197,15 @@ static inline dictEntryNoValue *decodeEntryNoValue(const dictEntry *de) {
 
 /* Returns 1 if the entry has a value field and 0 otherwise. */
 static inline int entryHasValue(const dictEntry *de) {
-    return entryIsNormal(de);
+    return !(entryIsKey(de) || entryIsNoValue(de));
+}
+
+/* Try to remove the next ptr in dictEntry */
+static inline dictEntry *tryCompactDictEntry(dictEntry *de) {
+    if (!de) return NULL;
+    if (entryIsKey(de) || entryIsSingle(de)) return de;
+    if (dictGetNext(de)) return de;
+    return (dictEntry *)((uintptr_t)realloc(de, sizeof(dictEntrySingle)) | ENTRY_PTR_SINGLE);
 }
 
 /* ----------------------------- API implementation ------------------------- */
@@ -592,7 +600,7 @@ dictEntry *dictAddOrFind(dict *d, void *key) {
  * of those functions. */
 static dictEntry *dictGenericDelete(dict *d, const void *key, int nofree) {
     uint64_t h, idx;
-    dictEntry *he, *prevHe;
+    dictEntry *he, *prevHe, *pprevHe;
     int table;
 
     /* dict is empty */
@@ -605,21 +613,31 @@ static dictEntry *dictGenericDelete(dict *d, const void *key, int nofree) {
         idx = h & DICTHT_SIZE_MASK(d->ht_size_exp[table]);
         if (table == 0 && (long)idx < d->rehashidx) continue;
         he = d->ht_table[table][idx];
-        prevHe = NULL;
+        prevHe = pprevHe = NULL;
         while(he) {
             void *he_key = dictGetKey(he);
             if (key == he_key || dictCompareKeys(d, key, he_key)) {
                 /* Unlink the element from the list */
-                if (prevHe)
-                    dictSetNext(prevHe, dictGetNext(he));
-                else
-                    d->ht_table[table][idx] = dictGetNext(he);
+                if (prevHe) {
+                    if (dictGetNext(he)) {
+                        dictSetNext(prevHe, dictGetNext(he));
+                    } else {
+                        if (pprevHe == NULL) {
+                            d->ht_table[table][idx] = tryCompactDictEntry(dictGetNext(he));
+                        } else {
+                            dictSetNext(pprevHe, tryCompactDictEntry(prevHe));
+                        }
+                    }
+                } else {
+                    d->ht_table[table][idx] = tryCompactDictEntry(dictGetNext(he));
+                }
                 if (!nofree) {
                     dictFreeUnlinkedEntry(d, he);
                 }
                 d->ht_used[table]--;
                 return he;
             }
+            if (prevHe) pprevHe = prevHe;
             prevHe = he;
             he = dictGetNext(he);
         }
@@ -865,29 +883,30 @@ static dictEntry *dictGetNext(const dictEntry *de) {
     if (entryIsKey(de) || (entryIsSingle(de)))
         return NULL; /* there's no next */
     if (entryIsNoValue(de)) return decodeEntryNoValue(de)->next;
-    return de->next;
+    return ((dictEntry *)decodeMaskedPtr(de))->next;
 }
 
 /* Returns a pointer to the 'next' field in the entry or NULL if the entry
  * doesn't have a next field. */
 static dictEntry **dictGetNextRef(dictEntry *de) {
-    if (entryIsKey(de)) return NULL;
+    if (entryIsKey(de) || (entryIsSingle(de))) return NULL;
     if (entryIsNoValue(de)) return &decodeEntryNoValue(de)->next;
-    return &de->next;
+    return &(((dictEntry *)decodeMaskedPtr(de))->next);
 }
 
 static void dictSetNext(dictEntry *de, dictEntry *next) {
-    assert(!entryIsKey(de));
+    assert(!entryIsKey(de) || (entryIsSingle(de)));
     if (entryIsNoValue(de)) {
         dictEntryNoValue *entry = decodeEntryNoValue(de);
         entry->next = next;
     } else {
-        de->next = next;
+        ((dictEntry *)(decodeMaskedPtr(de)))->next = next;
     }
 }
 
 /* Returns the memory usage in bytes of the dict, excluding the size of the keys
  * and values. */
+/* TODO how to caculate the next ptr */
 size_t dictMemUsage(const dict *d) {
     return dictSize(d) * sizeof(dictEntry) +
         dictBuckets(d) * sizeof(dictEntry*);
@@ -1177,7 +1196,20 @@ static void dictDefragBucket(dictEntry **bucketref, dictDefragFunctions *defragf
         if (entryIsKey(de)) {
             if (newkey) *bucketref = newkey;
             assert(entryIsKey(*bucketref));
-        } else if (entryIsNoValue(de)) {
+        } else {
+            dictEntry *entry = decodeMaskedPtr(de), *newentry;
+            if ((newentry = defragalloc(entry))) {
+                newde = encodeMaskedPtr(newentry, (unsigned int)((unsigned long long)de & ENTRY_PTR_MASK));
+                entry = newentry;
+            }
+            if (newde) de = newde;
+            if (newkey) entry->key = newkey;
+            if (newval) entry->v.val = newval;
+        }
+
+        /*
+         if (entryIsNoValue(de)) {
+
             dictEntryNoValue *entry = decodeEntryNoValue(de), *newentry;
             if ((newentry = defragalloc(entry))) {
                 newde = encodeMaskedPtr(newentry, ENTRY_PTR_NO_VALUE);
@@ -1190,7 +1222,7 @@ static void dictDefragBucket(dictEntry **bucketref, dictDefragFunctions *defragf
             if (newde) de = newde;
             if (newkey) de->key = newkey;
             if (newval) de->v.val = newval;
-        }
+        }*/
         if (newde) {
             *bucketref = newde;
         }
