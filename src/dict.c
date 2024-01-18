@@ -164,7 +164,7 @@ static inline dictEntry *createEntryNoValue(void *key, dictEntry *next) {
 static inline dictEntry *createEntrySingle(void *key) {
     dictEntrySingle *entry = zmalloc(sizeof(*entry));
     entry->key = key;
-    return (dictEntry *)(entry);
+    return (dictEntry *)((uintptr_t)(void *)entry | ENTRY_PTR_SINGLE);
 }
 
 /* Creates an entry without next ptr. */
@@ -176,7 +176,7 @@ static inline dictEntry *createEntryNormal(void *key, dictEntry *next) {
      * system it is more likely that recently added entries are accessed
      * more frequently. */
     entry->next = next;
-    return (dictEntry *)(void *)((uintptr_t)(void *)entry | ENTRY_PTR_NORMAL);
+    return (dictEntry *)((uintptr_t)entry | ENTRY_PTR_NORMAL);
 }
 
 static inline dictEntry *encodeMaskedPtr(const void *ptr, unsigned int bits) {
@@ -200,12 +200,26 @@ static inline int entryHasValue(const dictEntry *de) {
     return !(entryIsKey(de) || entryIsNoValue(de));
 }
 
-/* Try to remove the next ptr in dictEntry */
-static inline dictEntry *tryCompactDictEntry(dictEntry *de) {
-    if (!de) return NULL;
+/* remove the next ptr in dictEntry */
+static inline dictEntry *compactEntry(dictEntry *de) {
     if (entryIsKey(de) || entryIsSingle(de)) return de;
-    if (dictGetNext(de)) return de;
-    return (dictEntry *)((uintptr_t)realloc(de, sizeof(dictEntrySingle)) | ENTRY_PTR_SINGLE);
+    assert(entryIsNormal(de) || entryIsNoValue(de));
+    if (entryIsNoValue(de)) {
+        void *key = decodeEntryNoValue(de)->key;
+        zfree(decodeEntryNoValue(de));
+        return (dictEntry *)key;
+    }
+    return (dictEntry *)((uintptr_t)zrealloc(decodeMaskedPtr(de), sizeof(dictEntrySingle)) | ENTRY_PTR_SINGLE);
+}
+/* add the next ptr to dictEntry */
+static inline dictEntry *uncompactEntry(dictEntry *de) {
+    if (entryIsNoValue(de) || entryIsNormal(de)) return de;
+    assert(entryIsSingle(de) || entryIsKey(de));
+    if (entryIsSingle(de)) {
+        de = zrealloc(decodeMaskedPtr(de), sizeof(dictEntry));
+        return (dictEntry *)(((uintptr_t)(void *)de) | ENTRY_PTR_NORMAL);
+    }
+    return createEntryNoValue(de, NULL);
 }
 
 /* ----------------------------- API implementation ------------------------- */
@@ -385,16 +399,12 @@ int dictRehash(dict *d, int n) {
                  * to get the bucket index in the smaller table. */
                 h = d->rehashidx & DICTHT_SIZE_MASK(d->ht_size_exp[1]);
             }
+#if 0
             if (d->type->no_value) {
                 if (d->type->keys_are_odd && !d->ht_table[1][h]) {
                     /* Destination bucket is empty and we can store the key
                      * directly without an allocated entry. Free the old entry
-                     * if it's an allocated entry.
-                     *
-                     * TODO: Add a flag 'keys_are_even' and if set, we can use
-                     * this optimization for these dicts too. We can set the LSB
-                     * bit when stored as a dict entry and clear it again when
-                     * we need the key back. */
+                     * if it's an allocated entry. */
                     assert(entryIsKey(key));
                     if (!entryIsKey(de)) zfree(decodeMaskedPtr(de));
                     de = key;
@@ -408,8 +418,14 @@ int dictRehash(dict *d, int n) {
                     dictSetNext(de, d->ht_table[1][h]);
                 }
             } else {
+#endif
+            if (!d->ht_table[1][h]) {
+                de = compactEntry(de); // try to remove the next ptr
+            } else {
+                de = uncompactEntry(de); // need infating
                 dictSetNext(de, d->ht_table[1][h]);
             }
+            //}
             d->ht_table[1][h] = de;
             d->ht_used[0]--;
             d->ht_used[1]++;
@@ -527,12 +543,7 @@ dictEntry *dictInsertAtPosition(dict *d, void *key, void *position) {
     if (d->type->no_value) {
         if (d->type->keys_are_odd && !*bucket) {
             /* We can store the key directly in the destination bucket without the
-             * allocated entry.
-             *
-             * TODO: Add a flag 'keys_are_even' and if set, we can use this
-             * optimization for these dicts too. We can set the LSB bit when
-             * stored as a dict entry and clear it again when we need the key
-             * back. */
+             * allocated entry. */
             entry = key;
             assert(entryIsKey(entry));
         } else {
@@ -622,14 +633,24 @@ static dictEntry *dictGenericDelete(dict *d, const void *key, int nofree) {
                     if (dictGetNext(he)) {
                         dictSetNext(prevHe, dictGetNext(he));
                     } else {
+                        /* prevHe's next ptr is no needed,so we could compact the entry */
                         if (pprevHe == NULL) {
-                            d->ht_table[table][idx] = tryCompactDictEntry(dictGetNext(he));
+                            d->ht_table[table][idx] = compactEntry(prevHe);
                         } else {
-                            dictSetNext(pprevHe, tryCompactDictEntry(prevHe));
+                            dictSetNext(pprevHe, compactEntry(prevHe));
                         }
                     }
                 } else {
-                    d->ht_table[table][idx] = tryCompactDictEntry(dictGetNext(he));
+                    dictEntry *nextHe = dictGetNext(he);
+                    if (nextHe) {
+                        if (dictGetNext(nextHe)) {
+                            d->ht_table[table][idx] = nextHe;
+                        } else {
+                            d->ht_table[table][idx] = compactEntry(dictGetNext(he));
+                        }
+                    } else {
+                        d->ht_table[table][idx] = NULL;
+                    }
                 }
                 if (!nofree) {
                     dictFreeUnlinkedEntry(d, he);
@@ -880,6 +901,7 @@ double *dictGetDoubleValPtr(dictEntry *de) {
 /* Returns the 'next' field of the entry or NULL if the entry doesn't have a
  * 'next' field. */
 static dictEntry *dictGetNext(const dictEntry *de) {
+    assert(((uintptr_t)(void *)de) > ENTRY_PTR_MASK);
     if (entryIsKey(de) || (entryIsSingle(de)))
         return NULL; /* there's no next */
     if (entryIsNoValue(de)) return decodeEntryNoValue(de)->next;
@@ -895,7 +917,7 @@ static dictEntry **dictGetNextRef(dictEntry *de) {
 }
 
 static void dictSetNext(dictEntry *de, dictEntry *next) {
-    assert(!entryIsKey(de) || (entryIsSingle(de)));
+    assert(entryIsNoValue(de) || (entryIsNormal(de)));
     if (entryIsNoValue(de)) {
         dictEntryNoValue *entry = decodeEntryNoValue(de);
         entry->next = next;
@@ -1523,7 +1545,7 @@ void *dictFindPositionForInsert(dict *d, const void *key, dictEntry **existing) 
         if (table == 0 && (long)idx < d->rehashidx) continue; 
         /* Search if this slot does not already contain the given key */
         he = d->ht_table[table][idx];
-        while(he) {
+        while (he) {
             void *he_key = dictGetKey(he);
             if (key == he_key || dictCompareKeys(d, key, he_key)) {
                 if (existing) *existing = he;
