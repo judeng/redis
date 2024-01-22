@@ -43,6 +43,7 @@ static void pauseClientsByClient(mstime_t end, int isPauseClientAll);
 int postponeClientRead(client *c);
 char *getClientSockname(client *c);
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
+static client *pseudo_client = NULL;  /* TODO */
 
 /* Return the size consumed from the allocator, for the specified SDS string,
  * including internal fragmentation. This function is used in order to compute
@@ -1307,16 +1308,26 @@ void clientAcceptHandler(connection *conn) {
             return;
         }
     }
-
-    server.stat_numconnections++;
-    moduleFireServerEvent(REDISMODULE_EVENT_CLIENT_CHANGE,
-                          REDISMODULE_SUBEVENT_CLIENT_CHANGE_CONNECTED,
-                          c);
 }
 
+/* help function, bind the fake client with a real conn */
+static inline void bindPseudoClientWithConn(client *c, connection *conn, int flags) {
+    c->conn = conn;
+    connSetPrivateData(conn, c);
+    c->flags |= flags;
+    return;
+}
+/* help function, reset the fake client for the next use */
+static inline void resetPseudoClient(client *c) {
+    c->conn = NULL;
+    c->flags = 0;
+    sdsfree(c->sockname);
+    sdsfree(c->peerid);
+}
 void acceptCommonHandler(connection *conn, int flags, char *ip) {
-    client *c;
     UNUSED(ip);
+    if (pseudo_client == NULL) pseudo_client = createClient(NULL);
+    client *c = pseudo_client;
 
     if (connGetState(conn) != CONN_STATE_ACCEPTING) {
         char addr[NET_ADDR_STR_LEN] = {0};
@@ -1356,22 +1367,6 @@ void acceptCommonHandler(connection *conn, int flags, char *ip) {
         return;
     }
 
-    /* Create connection and client */
-    if ((c = createClient(conn)) == NULL) {
-        char addr[NET_ADDR_STR_LEN] = {0};
-        char laddr[NET_ADDR_STR_LEN] = {0};
-        connFormatAddr(conn, addr, sizeof(addr), 1);
-        connFormatAddr(conn, laddr, sizeof(addr), 0);
-        serverLog(LL_WARNING,
-                  "Error registering fd event for the new client connection: %s (addr=%s laddr=%s)",
-                  connGetLastError(conn), addr, laddr);
-        connClose(conn); /* May be already closed, just ignore errors */
-        return;
-    }
-
-    /* Last chance to keep flags */
-    c->flags |= flags;
-
     /* Initiate accept.
      *
      * Note that connAccept() is free to do two things here:
@@ -1380,14 +1375,36 @@ void acceptCommonHandler(connection *conn, int flags, char *ip) {
      *
      * Because of that, we must do nothing else afterwards.
      */
+    /* Here we use a pseudo client so that we can avoid expensive client creation and destruction when the conn is
+     * closed due to an exception such as the protected-mode */
+    bindPseudoClientWithConn(c, conn, flags);
     if (connAccept(conn, clientAcceptHandler) == C_ERR) {
         if (connGetState(conn) == CONN_STATE_ERROR)
             serverLog(LL_WARNING,
                       "Error accepting a client connection: %s (addr=%s laddr=%s)",
                       connGetLastError(conn), getClientPeerId(c), getClientSockname(c));
-        freeClient(connGetPrivateData(conn));
+        resetPseudoClient(c);
+        connClose(conn);
         return;
     }
+
+    /* Create connection and the real client */
+    if ((c = createClient(conn)) == NULL) {
+        char addr[NET_ADDR_STR_LEN] = { 0 };
+        char laddr[NET_ADDR_STR_LEN] = { 0 };
+        connFormatAddr(conn, addr, sizeof(addr), 1);
+        connFormatAddr(conn, laddr, sizeof(addr), 0);
+        serverLog(LL_WARNING, "Error registering fd event for the new client connection: %s (addr=%s laddr=%s)",
+                  connGetLastError(conn), addr, laddr);
+        connClose(conn); /* May be already closed, just ignore errors */
+        return;
+    }
+
+    /* Last chance to keep flags */
+    c->flags |= flags;
+
+    server.stat_numconnections++;
+    moduleFireServerEvent(REDISMODULE_EVENT_CLIENT_CHANGE, REDISMODULE_SUBEVENT_CLIENT_CHANGE_CONNECTED, c);
 }
 
 void freeClientOriginalArgv(client *c) {
@@ -1727,6 +1744,9 @@ void freeClient(client *c) {
  * a context where calling freeClient() is not possible, because the client
  * should be valid for the continuation of the flow of the program. */
 void freeClientAsync(client *c) {
+    /* we do not free the pseudo client so we can reuse it */
+    if (c == pseudo_client) return;
+
     /* We need to handle concurrent access to the server.clients_to_close list
      * only in the freeClientAsync() function, since it's the only function that
      * may access the list while Redis uses I/O threads. All the other accesses
